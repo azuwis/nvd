@@ -553,17 +553,13 @@ class PackageListEntrySizeComparator(PackageListEntryComparator):
 
         return cmp(get_delta(a), get_delta(b))
 
-ALL_SORTS: dict[str, PackageListEntryComparator] = {
-    sk.name(): sk
-    for sk in (
-        # The first one listed here is the default.
-        PackageListEntryNameComparator(),
-        PackageListEntrySemVerChangeComparator(),
-        PackageListEntrySizeComparator(),
-    )
+ALL_SORTS: dict[str, type[PackageListEntryComparator]] = {
+    "name": PackageListEntryNameComparator,
+    "semver": PackageListEntrySemVerChangeComparator,
+    "size": PackageListEntrySizeComparator,
 }
 
-DEFAULT_SORT: PackageListEntryComparator = next(iter(ALL_SORTS.values()))
+DEFAULT_SORT: PackageListEntryComparator = PackageListEntryNameComparator()
 
 class PackageListEntryCombinedComparator(PackageListEntryComparator):
     def __init__(self, comparators: Iterable[PackageListEntryComparator]):
@@ -582,11 +578,12 @@ class PackageListEntryCombinedComparator(PackageListEntryComparator):
             if reverse:
                 spec = spec[1:]
 
-            comparator = ALL_SORTS.get(spec, None)
-            if comparator is None:
+            comparator_cls = ALL_SORTS.get(spec, None)
+            if comparator_cls is None:
                 sys.stderr.write(f"nvd: Error, unknown sort key '{spec}'.\n")
                 sys.exit(1)
 
+            comparator = comparator_cls()
             if reverse:
                 comparator = comparator.reversed()
 
