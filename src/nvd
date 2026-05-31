@@ -512,12 +512,54 @@ class PackageListEntrySemVerChangeComparator(PackageListEntryComparator):
             b.find_first_changed_version_chunk(),
         )
 
+
+class PackageListEntrySizeComparator(PackageListEntryComparator):
+    """Sorts package list entries by size change (smallest delta first)."""
+
+    def __init__(self):
+        self._size_map: Optional[dict[str, int]] = None
+        self._fixed_install_state: Optional[str] = None
+
+    def name(self) -> str:
+        return "size"
+
+    def set_sort_context(self, **kwargs) -> None:
+        self._size_map = kwargs.get("size_map")
+        self._fixed_install_state = kwargs.get("fixed_install_state")
+
+    def cmp_packages(self, a: PackageListEntry, b: PackageListEntry) -> int:
+        if not self._size_map:
+            return 0
+
+        def get_delta(entry: PackageListEntry) -> int:
+            left_pkgs = entry.get_left_packages()
+            right_pkgs = entry.get_right_packages()
+            left_sum = sum(
+                self._size_map.get(str(p.store_path().path()), 0) for p in left_pkgs
+            )
+            if right_pkgs is not None:
+                right_sum = sum(
+                    self._size_map.get(str(p.store_path().path()), 0) for p in right_pkgs
+                )
+                return right_sum - left_sum
+            elif self._fixed_install_state == INST_ADDED:
+                # left_package_set is actually the right closure; show +size
+                return left_sum
+            elif self._fixed_install_state == INST_REMOVED:
+                return -left_sum
+            else:
+                # INST_INSTALLED or INST_CHANGED: sort by plain size, smallest first
+                return left_sum
+
+        return cmp(get_delta(a), get_delta(b))
+
 ALL_SORTS: dict[str, PackageListEntryComparator] = {
     sk.name(): sk
     for sk in (
         # The first one listed here is the default.
         PackageListEntryNameComparator(),
         PackageListEntrySemVerChangeComparator(),
+        PackageListEntrySizeComparator(),
     )
 }
 
@@ -648,6 +690,7 @@ def print_packages(
     right_package_set: Optional[PackageSet] = None,
     fixed_install_state: Optional[str] = None,
     no_version_suffix_highlight: bool = False,
+    size_map: Optional[dict[str, int]] = None,
 ):
     assert (right_package_set is None) != (fixed_install_state is None), \
         "Expect either one package set, or a fixed install state."
@@ -660,6 +703,13 @@ def print_packages(
     # If we've been asked to sort, then apply the sort to the pnames list, since
     # we use that list's order to print things.
     if sort_comparator is not None:
+        sort_comparator.set_sort_context(
+            size_map=size_map,
+            left_package_set=left_package_set,
+            right_package_set=right_package_set,
+            fixed_install_state=fixed_install_state,
+        )
+
         entries_to_sort: list[PackageListEntry] = [
             PackageListEntry(
                 left_packages=left_package_set.get_pname_packages(pname),
@@ -682,6 +732,34 @@ def print_packages(
     count_format_str = "#{:0" + str(count_width) + "d}"
     pname_width = max(len(pname) for pname in pnames)
     pname_format_str = "{:" + str(pname_width) + "}"
+
+    # Compute size column.
+    size_strings: dict[str, str] = {}
+    size_format_str: Optional[str] = None
+    if size_map:
+        sums: dict[str, tuple[int, Optional[int]]] = {}
+        for pname in pnames:
+            left_pkgs = left_package_set.get_pname_packages(pname)
+            left_sum = sum(
+                size_map.get(str(p.store_path().path()), 0) for p in left_pkgs
+            )
+            right_sum: Optional[int] = None
+            if right_package_set is not None:
+                right_pkgs = right_package_set.get_pname_packages(pname)
+                right_sum = sum(
+                    size_map.get(str(p.store_path().path()), 0) for p in right_pkgs
+                )
+            sums[pname] = (left_sum, right_sum)
+
+        if right_package_set is not None:
+            render_mode = "delta"
+        elif fixed_install_state == INST_ADDED:
+            render_mode = "positive"
+        elif fixed_install_state == INST_REMOVED:
+            render_mode = "negative"
+        else:
+            render_mode = "plain"
+        size_strings, size_width, size_format_str = _compute_size_info(sums, render_mode)
 
     for pname in pnames:
         left_versions = left_package_set.get_pname_versions(pname)
@@ -729,26 +807,30 @@ def print_packages(
         )
         count_str = count_format_str.format(count)
         pname_str = pname_format_str.format(pname)
-        print("{}  {}  {}  {}{}".format(
-            status_str,
-            count_str,
-            pname_sgr + pname_str + sgr(SGR_RESET),
-            render_versions(
-                left_versions,
+        # Build version string.
+        version_str = render_versions(
+            left_versions,
+            colour=True,
+            version_highlight=version_highlight,
+            highlight_from_pos=versions_common_prefix_len,
+        )
+        if not have_single_version:
+            version_str += " -> " + render_versions(
+                right_versions,
                 colour=True,
                 version_highlight=version_highlight,
                 highlight_from_pos=versions_common_prefix_len,
-            ),
-            "" if have_single_version else (
-                " -> " + render_versions(
-                    right_versions,
-                    colour=True,
-                    version_highlight=version_highlight,
-                    highlight_from_pos=versions_common_prefix_len,
-                    is_right=True,
-                )
-            ),
-        ))
+                is_right=True,
+            )
+
+        # Build parts: status, count, pname, [size,] version
+        parts = [status_str, count_str, pname_sgr + pname_str + sgr(SGR_RESET)]
+        if size_format_str is not None:
+            colored = render_size(size_strings.get(pname, ""), size_format_str)
+            if colored:
+                parts.append(colored)
+        parts.append(version_str)
+        print("  ".join(parts))
         count += 1
 
 def find_common_version_prefix(x: str, y: str, limit: Optional[int]) -> int:
@@ -979,8 +1061,7 @@ def query_store_paths_sizes(paths: Iterable[str]) -> dict[str, int]:
 
     if result.returncode != 0:
         sys.stderr.write(
-            f"nvd: Warning, 'nix path-info --size' returned {result.returncode}: "
-            f"{result.stderr.strip()}\n"
+            f"nvd: Warning, 'nix path-info --size' exited with code {result.returncode}.\n"
         )
         return {}
 
@@ -1148,6 +1229,8 @@ def run_list(
 
     target_pnames.sort()
 
+    size_map = query_store_paths_sizes(closure_set.all_store_paths())
+
     print_packages(
         pnames=target_pnames,
         selected_sets=PackageSetPair(selected_set, selected_set),
@@ -1156,6 +1239,7 @@ def run_list(
         fixed_install_state=INST_INSTALLED,
         sort_comparator=sort_comparator,
         version_highlight=version_highlight,
+        size_map=size_map,
     )
 
 def run_diff(
@@ -1198,6 +1282,10 @@ def run_diff(
 
     left_closure_set = PackageSet.from_closure(left_resolved)
     right_closure_set = PackageSet.from_closure(right_resolved)
+
+    # Query sizes for all store paths.
+    all_paths = set(left_closure_set.all_store_paths()) | set(right_closure_set.all_store_paths())
+    size_map = query_store_paths_sizes(all_paths)
 
     left_closure_all_package_names = set(left_closure_set.all_pnames())
     right_closure_all_package_names = set(right_closure_set.all_pnames())
@@ -1252,6 +1340,29 @@ def run_diff(
         added_package_names -= matched_right
         removed_package_names -= matched_left
 
+    # Sort pname changes using the sort comparator.
+    if sort_comparator is not None and pname_changes:
+        sort_comparator.set_sort_context(
+            size_map=size_map,
+            left_package_set=left_closure_set,
+            right_package_set=right_closure_set,
+            fixed_install_state=None,
+        )
+        entries_with_data = [
+            (
+                PackageListEntry(
+                    left_packages=left_closure_set.get_pname_packages(left_pname),
+                    right_packages=right_closure_set.get_pname_packages(right_pname),
+                ),
+                (left_pname, right_pname, merged_str),
+            )
+            for left_pname, right_pname, merged_str in pname_changes
+        ]
+        entries_with_data.sort(
+            key=lambda pair: cmp_to_key(sort_comparator.cmp_packages)(pair[0])
+        )
+        pname_changes = [data for _, data in entries_with_data]
+
     any_changes_displayed = False
 
     # Announce version changes.
@@ -1265,6 +1376,7 @@ def run_diff(
             right_package_set=right_closure_set,
             sort_comparator=sort_comparator,
             version_highlight=version_highlight,
+            size_map=size_map,
         )
 
     # Announce pname changes (merged from added/removed).
@@ -1276,6 +1388,23 @@ def run_diff(
         count_format_str = "#{:0" + str(count_width) + "d}"
         max_merged_len = max(len(m) for _, _, m in pname_changes)
         merged_format_str = "{:" + str(max_merged_len) + "}"
+
+        # Pre-compute size strings.
+        pname_size_strings: dict[str, str] = {}
+        size_format_pname: Optional[str] = None
+        if size_map:
+            sums: dict[str, tuple[int, Optional[int]]] = {}
+            for left_pname, right_pname, merged_str in pname_changes:
+                left_size = sum(
+                    size_map.get(str(p.store_path().path()), 0)
+                    for p in left_closure_set.get_pname_packages(left_pname)
+                )
+                right_size = sum(
+                    size_map.get(str(p.store_path().path()), 0)
+                    for p in right_closure_set.get_pname_packages(right_pname)
+                )
+                sums[merged_str] = (left_size, right_size)
+            pname_size_strings, size_width_pname, size_format_pname = _compute_size_info(sums, "delta")
 
         for left_pname, right_pname, merged_str in pname_changes:
             left_pkgs = left_closure_set.get_pname_packages(left_pname)
@@ -1333,12 +1462,14 @@ def run_diff(
                 is_right=True,
             )
 
-            print("{}  {}  {}  {}".format(
-                status_str,
-                count_str,
-                pname_sgr + merged_str_padded + sgr(SGR_RESET),
-                ver_str,
-            ))
+            # Build parts: status, count, merged_pname, [size,] version
+            parts = [status_str, count_str, pname_sgr + merged_str_padded + sgr(SGR_RESET)]
+            if size_format_pname is not None:
+                colored = render_size(pname_size_strings.get(merged_str, ""), size_format_pname)
+                if colored:
+                    parts.append(colored)
+            parts.append(ver_str)
+            print("  ".join(parts))
             count += 1
 
     # Announce specific changes for packages whose versions haven't changed.
@@ -1352,6 +1483,7 @@ def run_diff(
             fixed_install_state=INST_CHANGED,
             sort_comparator=sort_comparator,
             version_highlight=version_highlight,
+            size_map=size_map,
         )
 
     # Announce added packages.
@@ -1365,6 +1497,7 @@ def run_diff(
             fixed_install_state=INST_ADDED,
             sort_comparator=sort_comparator,
             version_highlight=version_highlight,
+            size_map=size_map,
         )
 
     # Announce removed packages.
@@ -1378,6 +1511,7 @@ def run_diff(
             fixed_install_state=INST_REMOVED,
             sort_comparator=sort_comparator,
             version_highlight=version_highlight,
+            size_map=size_map,
         )
 
     if not any_changes_displayed:
@@ -1473,7 +1607,7 @@ def parse_args():
         p.add_argument(
             "--sort",
             default=DEFAULT_SORT.name(),
-            help="Sort order for displayed packages.",
+            help="Sort order for displayed packages (name, semver, size).",
         )
 
     def add_no_merge_arg(p: argparse.ArgumentParser) -> None:
