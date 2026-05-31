@@ -797,6 +797,83 @@ def find_common_version_prefix_lists(*lsts: list[str]) -> int:
 
     return i
 
+
+def merge_pnames(left_pname: str, right_pname: str) -> Optional[str]:
+    """
+    Merge two pnames that differ only in a version-like component.
+
+    Returns a merged representation like 'python3.{13->14}-aiohttp',
+    or None if the pnames cannot be merged (e.g. they are unrelated).
+
+    Algorithm:
+    1. Find longest common prefix (LCP)
+    2. Find longest common suffix (LCS) on the remaining parts
+    3. The middle is the differing part
+    4. Extend prefix and suffix boundaries through adjacent digits
+       to capture the full version component that changed
+    5. Return 'prefix{middle_left->middle_right}suffix'
+    """
+    if left_pname == right_pname:
+        return None
+
+    # Find longest common prefix
+    lcp_len = 0
+    while (lcp_len < len(left_pname) and lcp_len < len(right_pname)
+           and left_pname[lcp_len] == right_pname[lcp_len]):
+        lcp_len += 1
+
+    if lcp_len == 0:
+        return None
+
+    prefix = left_pname[:lcp_len]
+    a_rest = left_pname[lcp_len:]
+    b_rest = right_pname[lcp_len:]
+
+    # Find longest common suffix on the remaining parts
+    lcs_len = 0
+    while (lcs_len < len(a_rest) and lcs_len < len(b_rest)
+           and a_rest[-1 - lcs_len] == b_rest[-1 - lcs_len]):
+        lcs_len += 1
+
+    suffix = a_rest[-lcs_len:] if lcs_len > 0 else ""
+    a_mid = a_rest[:-lcs_len] if lcs_len > 0 else a_rest
+    b_mid = b_rest[:-lcs_len] if lcs_len > 0 else b_rest
+
+    # Require non-empty middles (they must differ)
+    if not a_mid or not b_mid:
+        return None
+
+    # Extend prefix backwards through adjacent digits
+    while prefix and prefix[-1].isdigit():
+        a_mid = prefix[-1] + a_mid
+        b_mid = prefix[-1] + b_mid
+        prefix = prefix[:-1]
+
+    # Extend suffix forwards through adjacent digits
+    while suffix and suffix[0].isdigit():
+        a_mid = a_mid + suffix[0]
+        b_mid = b_mid + suffix[0]
+        suffix = suffix[1:]
+
+    # The middles must be different
+    if a_mid == b_mid:
+        return None
+
+    # The middles must contain at least one digit each (version-like check)
+    if not any(ch.isdigit() for ch in a_mid) or not any(ch.isdigit() for ch in b_mid):
+        return None
+
+    # At minimum, prefix or suffix must be non-empty to avoid nonsense
+    if not prefix and not suffix:
+        return None
+
+    # Reject if middles contain package name separators (would merge unrelated packages).
+    if '-' in a_mid or '-' in b_mid or '_' in a_mid or '_' in b_mid:
+        return None
+
+    return f"{prefix}{{{a_mid}->{b_mid}}}{suffix}"
+
+
 def query_closure_disk_usage_bytes(target: Path) -> Optional[int]:
     # If we don't add "./" to relative paths, then newer nix will interpret the
     # argument as something related to flakes instead.
@@ -991,6 +1068,7 @@ def run_diff(
     sort_comparator: PackageListEntryComparator,
     only_selected: bool,
     version_highlight: str,
+    no_merge: bool = False,
 ):
     left_path = Path(root1)
     right_path = Path(root2)
@@ -1052,6 +1130,31 @@ def run_diff(
         added_package_names &= pnames_selected_in_either_closure
         removed_package_names &= pnames_selected_in_either_closure
 
+    # Detect mergeable pname pairs (e.g. python3.13-aiohttp -> python3.14-aiohttp).
+    pname_changes = []  # list of (left_pname, right_pname, merged_str)
+    if not no_merge:
+        added = list(added_package_names)
+        removed = list(removed_package_names)
+        matched_left = set()
+        matched_right = set()
+
+        for left_pname in sorted(removed):
+            if left_pname in matched_left:
+                continue
+            for right_pname in sorted(added):
+                if right_pname in matched_right:
+                    continue
+                merged = merge_pnames(left_pname, right_pname)
+                if merged is not None:
+                    pname_changes.append((left_pname, right_pname, merged))
+                    matched_left.add(left_pname)
+                    matched_right.add(right_pname)
+                    break
+
+        # Remove merged packages from added/removed sets.
+        added_package_names -= matched_right
+        removed_package_names -= matched_left
+
     any_changes_displayed = False
 
     # Announce version changes.
@@ -1066,6 +1169,80 @@ def run_diff(
             sort_comparator=sort_comparator,
             version_highlight=version_highlight,
         )
+
+    # Announce pname changes (merged from added/removed).
+    if pname_changes:
+        any_changes_displayed = True
+        print("Pname changes:")
+        count = 1
+        count_width = len(str(len(pname_changes)))
+        count_format_str = "#{:0" + str(count_width) + "d}"
+        max_merged_len = max(len(m) for _, _, m in pname_changes)
+        merged_format_str = "{:" + str(max_merged_len) + "}"
+
+        for left_pname, right_pname, merged_str in pname_changes:
+            left_pkgs = left_closure_set.get_pname_packages(left_pname)
+            right_pkgs = right_closure_set.get_pname_packages(right_pname)
+
+            left_versions = [p.version() for p in left_pkgs]
+            right_versions = [p.version() for p in right_pkgs]
+
+            # Selection state: use left pname for left set, right pname for right set.
+            in_left_sel = (left_selected_set is not None
+                           and left_selected_set.contains_pname(left_pname))
+            in_right_sel = (right_selected_set is not None
+                            and right_selected_set.contains_pname(right_pname))
+            selected_at_all = in_left_sel or in_right_sel
+            if selected_at_all:
+                bold_if_selected_sgr = sgr(SGR_BOLD)
+                pname_sgr = bold_if_selected_sgr + sgr(SGR_FG + SGR_GREEN + SGR_BRIGHT)
+            else:
+                bold_if_selected_sgr = ""
+                pname_sgr = bold_if_selected_sgr + sgr(SGR_FG + SGR_GREEN)
+
+            if in_left_sel == in_right_sel:
+                sel_char = SEL_SELECTED if in_left_sel else SEL_UNSELECTED
+            else:
+                sel_char = (SEL_SELECTED if in_left_sel else SEL_UNSELECTED) + \
+                           (SEL_SELECTED if in_right_sel else SEL_UNSELECTED)
+
+            status_str = "[{}{}]".format(
+                bold_if_selected_sgr + INST_UPGRADED + sgr(SGR_RESET),
+                pname_sgr + sel_char + sgr(SGR_RESET),
+            )
+            count_str = count_format_str.format(count)
+            merged_str_padded = merged_format_str.format(merged_str)
+
+            # Compute version common prefix for highlighting.
+            versions_common_prefix_len: Optional[int]
+            if version_highlight == VERSION_HIGHLIGHT_NONE:
+                versions_common_prefix_len = None
+            else:
+                versions_common_prefix_len = find_common_version_prefix_lists(
+                    [v.text() for v in left_versions if v.text() != ""],
+                    [v.text() for v in right_versions if v.text() != ""],
+                )
+
+            ver_str = render_versions(
+                left_versions,
+                colour=True,
+                version_highlight=version_highlight,
+                highlight_from_pos=versions_common_prefix_len,
+            ) + " -> " + render_versions(
+                right_versions,
+                colour=True,
+                version_highlight=version_highlight,
+                highlight_from_pos=versions_common_prefix_len,
+                is_right=True,
+            )
+
+            print("{}  {}  {}  {}".format(
+                status_str,
+                count_str,
+                pname_sgr + merged_str_padded + sgr(SGR_RESET),
+                ver_str,
+            ))
+            count += 1
 
     # Announce specific changes for packages whose versions haven't changed.
     if package_names_with_changed_selection_states:
@@ -1140,6 +1317,7 @@ def run_history(
     sort_comparator: PackageListEntryComparator,
     only_selected: bool,
     version_highlight: str,
+    no_merge: bool = False,
 ):
     profile_path = Path(profile)
 
@@ -1183,6 +1361,7 @@ def run_history(
             sort_comparator=sort_comparator,
             only_selected=only_selected,
             version_highlight=version_highlight,
+            no_merge=no_merge,
         )
 
 def parse_args():
@@ -1198,6 +1377,15 @@ def parse_args():
             "--sort",
             default=DEFAULT_SORT.name(),
             help="Sort order for displayed packages.",
+        )
+
+    def add_no_merge_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--no-merge",
+            action="store_true",
+            default=False,
+            help="Disable merging of pnames that differ only in version components "
+                 "(e.g. python3.13-aiohttp -> python3.14-aiohttp).",
         )
 
     parser = argparse.ArgumentParser(
@@ -1233,6 +1421,7 @@ def parse_args():
         help="Diff two Nix store paths and their closures.")
     add_selected_arg(diff_parser)
     add_sort_arg(diff_parser)
+    add_no_merge_arg(diff_parser)
     diff_parser.add_argument(
         "root1",
         help="The first Nix store path to compare.")
@@ -1260,6 +1449,7 @@ def parse_args():
         help="Show the history of a Nix profile.")
     add_selected_arg(history_parser)
     add_sort_arg(history_parser)
+    add_no_merge_arg(history_parser)
     history_parser.add_argument(
         "-p", "--profile",
         default="/nix/var/nix/profiles/system",
