@@ -1,5 +1,15 @@
 # nvd changelog
 
+## 0.2.6 (unreleased)
+
+- Added pname merge support: packages like `python3.13-aiohttp` and
+  `python3.14-aiohttp` are merged into a single "Pname changes" entry as
+  `python3.{13->14}-aiohttp`.  Disable with `--no-merge`.
+
+- Added a size column between the package name and version in `diff`, `list`,
+  and `history` output, showing per-package NAR size changes. Uses `nix
+  path-info --size` for batch size queries.
+
 ## 0.2.5 (unreleased)
 
 - Fixed `nvd history` to ignore broken profile symlinks in case they were

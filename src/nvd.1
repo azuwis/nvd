@@ -13,6 +13,8 @@ nvd \- Nix/NixOS package version diff tool
 .I sort-order
 .B ]
 .br
+.B [ --no-merge ]
+.br
 .I root1
 .br
 .I root2
@@ -45,6 +47,8 @@ nvd \- Nix/NixOS package version diff tool
 .B [ --sort
 .I sort-order
 .B ]
+.br
+.B [ --no-merge ]
 .br
 .B [ -m|--minimum-version
 .I version
@@ -182,6 +186,24 @@ etc. binaries to use.  If provided, all invocations of Nix binaries will use
 this directory.  If empty or not provided, then invocations of Nix binaries will
 use regular path lookup.  This is the default.
 .TP
+--no-merge
+Do not merge package name changes.  When comparing two closures, packages that
+are removed on the left and added on the right with names that differ only in a
+version-like component (e.g.,
+.B python3.13-aiohttp
+and
+.BR python3.14-aiohttp )
+are merged into a single \[lq]Pname changes\[rq] entry, shown as
+.BR python3.{13->14}-aiohttp .
+Pass
+.B --no-merge
+to disable this behaviour and show the packages as separate added and removed
+entries.  This flag only affects the
+.B diff
+and
+.B history
+commands.
+.TP
 -s|--selected
 Only print out selected packages (direct dependencies).
 .TP
@@ -211,6 +233,15 @@ position of the first difference is used; the numeric difference between version
 numbers does not matter.  Because only the highest old and new versions are
 compared, this sort type may not produce ideal results if multiple versions of a
 package are present.
+.IP
+The keyword
+.B size
+sorts packages according to the signed size change (from `nix path-info --size`).
+Packages that decreased in size are listed first, followed by those that
+increased; the direction can be reversed with `-size`.  For the
+.B list
+command, where there is no size change to compare, packages are sorted by
+plain size ascending (smallest first).
 .TP
 -r|--root <store-path>
 For the
@@ -287,6 +318,25 @@ changes in the number of times a package
 .B (pname)
 appears will.
 .P
+When comparing two closures, packages that have been replaced by a newer version
+of themselves but with a different package name (such as language ecosystem
+packages like
+.BR python3.13-aiohttp
+becoming
+.BR python3.14-aiohttp )
+are detected and displayed as a separate \[lq]Pname changes\[rq] section, with
+the differing component collapsed into a compact notation
+.RI ( python3.{13->14}-aiohttp ).
+This behaviour can be disabled with
+.BR --no-merge .
+.P
+When showing differences between two closures, a size column is shown between
+the package name and version, indicating the NAR size change (from
+`nix path-info --size`) of each package.  Added packages show a positive size,
+removed packages a negative size.  The
+.B list
+subcommand shows the plain size (without a sign) of each package.
+.P
 The first two lines of output display the paths being compared:
 .P
 .RS
@@ -310,9 +360,9 @@ following.
 .P
 .RS
 .EX
-[U.]  #1  linux                   5.4.99 -> 5.4.100
- \(ha\(ha   \(ha   \(ha                       \(ha
- ||   |   package name            package versions
+[U.]  #1  linux                   +1.2MiB  5.4.99 -> 5.4.100
+ \(ha\(ha   \(ha   \(ha                \(ha         \(ha
+ ||   |   package name            size change  package versions
  ||   count of packages within the section
  |package selection state
  package install state
@@ -415,17 +465,17 @@ $ nvd diff /nix/var/nix/profiles/system-{29,30}-link
 <<< /nix/var/nix/profiles/system-29-link
 >>> /nix/var/nix/profiles/system-30-link
 Version changes:
-[C.]  #1  SDL2_ttf            2.0.15 -> 2.0.15 x2
-[C.]  #2  pkg-config          0.29.2 -> 0.29.2 x2
-[C.]  #3  pkg-config-wrapper  0.29.2 -> 0.29.2 x2
+[C.]  #1  SDL2_ttf            +0B  2.0.15 -> 2.0.15 x2
+[C.]  #2  pkg-config          +0B  0.29.2 -> 0.29.2 x2
+[C.]  #3  pkg-config-wrapper  +0B  0.29.2 -> 0.29.2 x2
 Added packages:
-[A.]  #1  CUnit         2.1-3
-[A.]  #2  SDL_mixer     1.2.12
-[A.]  #3  SDL_ttf       2.0.11
-[A+]  #4  liquidwar6    0.6.3902
-[A+]  #5  neverball     1.6.0
-[A.]  #6  physfs        3.0.2
-[A.]  #7  smpeg-svn390  <none>
+[A.]  #1  CUnit          +1.2MiB  2.1-3
+[A.]  #2  SDL_mixer      +1.1MiB  1.2.12
+[A.]  #3  SDL_ttf        +456KiB  2.0.11
+[A+]  #4  liquidwar6     +3.4MiB  0.6.3902
+[A+]  #5  neverball     +78.9MiB  1.6.0
+[A.]  #6  physfs         +234KiB  3.0.2
+[A.]  #7  smpeg-svn390   +567KiB  <none>
 Closure size: 2382 -> 2392 (21 paths added, 11 paths removed, delta +10, disk usage +312.5MiB).
 .EE
 .RE
@@ -447,18 +497,18 @@ $ nvd diff /nix/var/nix/profiles/system-{33,34}-link
 <<< /nix/var/nix/profiles/system/system-33-link
 >>> /nix/var/nix/profiles/system/system-34-link
 Version changes:
-[U*]  #1  cpupower                5.4.99 -> 5.4.100
-[U.]  #2  initrd-linux            5.4.99 -> 5.4.100
-[U.]  #3  linux                   5.4.99 -> 5.4.100
-[U.]  #4  nixos-system-unnamed    20.09.git.d041da76935 -> 20.09.git.872a1ebbb1b
-[U.]  #5  system76-acpi-module    1.0.1-5.4.99 -> 1.0.1-5.4.100
-[U.]  #6  system76-io-module      1.0.1-5.4.99 -> 1.0.1-5.4.100
-[U.]  #7  x86_energy_perf_policy  5.4.99 -> 5.4.100
-[U*]  #8  xterm                   353 -> 366
+[U*]  #1  cpupower                +1.2MiB  5.4.99 -> 5.4.100
+[U.]  #2  initrd-linux            -2.5MiB  5.4.99 -> 5.4.100
+[U.]  #3  linux                   +5.1MiB  5.4.99 -> 5.4.100
+[U.]  #4  nixos-system-unnamed    +176KiB  20.09.git.d041da76935 -> 20.09.git.872a1ebbb1b
+[U.]  #5  system76-acpi-module    +4.0KiB  1.0.1-5.4.99 -> 1.0.1-5.4.100
+[U.]  #6  system76-io-module      +4.0KiB  1.0.1-5.4.99 -> 1.0.1-5.4.100
+[U.]  #7  x86_energy_perf_policy  +4.0KiB  5.4.99 -> 5.4.100
+[U*]  #8  xterm                   +310KiB  353 -> 366
 Added packages:
-[A+]  #1  gpsbabel        1.6.0
-[A+]  #2  gpxsee          7.31
-[A.]  #3  qttranslations  5.15.2
+[A+]  #1  gpsbabel        +12.5MiB  1.6.0
+[A+]  #2  gpxsee           +8.2MiB  7.31
+[A.]  #3  qttranslations   +3.9MiB  5.15.2
 Closure size: 2480 -> 2483 (44 paths added, 41 paths removed, delta +3, disk usage +22.3MiB).
 .EE
 .RE
@@ -478,7 +528,7 @@ $ nvd diff /nix/var/nix/profiles/system-{43,44}-link
 <<< /nix/var/nix/profiles/system/system-43-link
 >>> /nix/var/nix/profiles/system/system-44-link
 Version changes:
-[D.]  #1  nixos-system-unnamed  20.09.git.61092780ec5 -> 20.09.git.f79caa0b693
+[D.]  #1  nixos-system-unnamed  -123KiB  20.09.git.61092780ec5 -> 20.09.git.f79caa0b693
 Closure size: 2329 -> 2329 (16 paths added, 16 paths removed, delta +0, disk usage +0B).
 .EE
 .RE
