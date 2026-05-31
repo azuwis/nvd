@@ -461,6 +461,10 @@ class PackageListEntryComparator:
     def reversed(self) -> "PackageListEntryComparator":
         return PackageListEntryReverseComparator(self)
 
+    def set_sort_context(self, **kwargs) -> None:
+        """Provide runtime context for comparators that need it (e.g. size map)."""
+        pass
+
 class PackageListEntryReverseComparator(PackageListEntryComparator):
     def __init__(self, delegate: PackageListEntryComparator):
         self._delegate = delegate
@@ -473,6 +477,9 @@ class PackageListEntryReverseComparator(PackageListEntryComparator):
 
     def reversed(self) -> PackageListEntryComparator:
         return self._delegate
+
+    def set_sort_context(self, **kwargs) -> None:
+        self._delegate.set_sort_context(**kwargs)
 
 class PackageListEntryNameComparator(PackageListEntryComparator):
     """Sorts package list entries by pname."""
@@ -561,6 +568,10 @@ class PackageListEntryCombinedComparator(PackageListEntryComparator):
 
     def reversed(self) -> PackageListEntryComparator:
         return PackageListEntryCombinedComparator(c.reversed() for c in self._comparators)
+
+    def set_sort_context(self, **kwargs) -> None:
+        for comparator in self._comparators:
+            comparator.set_sort_context(**kwargs)
 
 def parse_pname_version(path: str) -> tuple[str, Optional[str]]:
     base_path = str(StorePath(path).to_base_path().path())
@@ -874,6 +885,45 @@ def merge_pnames(left_pname: str, right_pname: str) -> Optional[str]:
     return f"{prefix}{{{a_mid}->{b_mid}}}{suffix}"
 
 
+def render_size(raw: str, fmt_str: Optional[str]) -> str:
+    """Render a size string with right-alignment and color."""
+    if not fmt_str or not raw:
+        return ""
+    padded = fmt_str.format(raw)
+    if raw.startswith("+") and raw != render_bytes(0):
+        return sgr(SGR_FG + SGR_GREEN) + padded + sgr(SGR_RESET)
+    elif raw.startswith("-"):
+        return sgr(SGR_FG + SGR_RED) + padded + sgr(SGR_RESET)
+    else:
+        return padded
+
+
+def _compute_size_info(
+    sums: dict[str, tuple[int, Optional[int]]],
+    render_mode: str,
+) -> tuple[dict[str, str], int, Optional[str]]:
+    """Compute size strings and formatting from left/right size sums.
+
+    sums maps each display key to (left_sum, right_sum_or_None).
+    render_mode: "delta", "positive", "negative", or "plain".
+    Returns (size_strings, max_width, format_str_or_None).
+    """
+    size_strings: dict[str, str] = {}
+    for key, (left_sum, right_sum) in sums.items():
+        if right_sum is not None:
+            size_strings[key] = render_bytes(right_sum - left_sum)
+        elif render_mode == "positive":
+            size_strings[key] = render_bytes(left_sum)
+        elif render_mode == "negative":
+            size_strings[key] = render_bytes(-left_sum)
+        else:  # plain
+            size_strings[key] = render_bytes(left_sum, always_sign=False)
+
+    width = max(len(s) for s in size_strings.values()) if size_strings else 0
+    fmt = "{:>" + str(width) + "s}" if width > 0 else None
+    return size_strings, width, fmt
+
+
 def query_closure_disk_usage_bytes(target: Path) -> Optional[int]:
     # If we don't add "./" to relative paths, then newer nix will interpret the
     # argument as something related to flakes instead.
@@ -902,9 +952,55 @@ def query_closure_disk_usage_bytes(target: Path) -> Optional[int]:
     words = lines[0].split()
     return int(words[-1])
 
+
+def query_store_paths_sizes(paths: Iterable[str]) -> dict[str, int]:
+    """
+    Query the size (narSize) of each store path using batch nix path-info --size.
+
+    Returns {store_path: size_in_bytes}.
+    On failure (e.g. nix not available), returns empty dict.
+    """
+    paths_list = list(paths)
+    if not paths_list:
+        return {}
+
+    try:
+        result = subprocess.run(
+            [make_nix_bin_path("nix")]
+            + make_extra_experimental_features_args()
+            + ["path-info", "--size", "--stdin"],
+            input="\n".join(paths_list),
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        sys.stderr.write("nvd: Error, couldn't run 'nix path-info --size'.\n")
+        return {}
+
+    if result.returncode != 0:
+        sys.stderr.write(
+            f"nvd: Warning, 'nix path-info --size' returned {result.returncode}: "
+            f"{result.stderr.strip()}\n"
+        )
+        return {}
+
+    size_map: dict[str, int] = {}
+    for line in result.stdout.strip("\n").split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                size_map[parts[0]] = int(parts[1])
+            except ValueError:
+                pass
+
+    return size_map
+
+
 BYTES_UNITS = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
 
-def render_bytes(bytes_size: int) -> str:
+def render_bytes(bytes_size: int, always_sign: bool = True) -> str:
     scaled_size: Union[int, float] = bytes_size
     scaled_suffix = "B"
 
@@ -922,10 +1018,11 @@ def render_bytes(bytes_size: int) -> str:
     if neg:
         scaled_size = -scaled_size
 
+    sign_fmt = "+," if always_sign else ","
     if isinstance(scaled_size, int):
-        return f"{scaled_size:+,d}{scaled_suffix}"  # B (bytes).
+        return f"{scaled_size:{sign_fmt}d}{scaled_suffix}"  # B (bytes).
     else:
-        return f"{scaled_size:+,.1f}{scaled_suffix}"  # KiB or higher.
+        return f"{scaled_size:{sign_fmt}.1f}{scaled_suffix}"  # KiB or higher.
 
 def make_nix_bin_path(exe_name: str) -> str:
     global NIX_BIN_DIR
